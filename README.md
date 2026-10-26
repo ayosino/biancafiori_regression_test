@@ -29,12 +29,12 @@
 
 ## 2. 使い方
 
-WSLターミナルから `/home/ayosino/biancafiori_regression_test` で実行します。
+ターミナルから `$HOME/biancafiori_regression_test` で実行します。
 
 ### Step 1: アップグレード前にベースラインを記録する (`record`)
 
 ```bash
-cd /home/ayosino/biancafiori_regression_test
+cd $HOME/biancafiori_regression_test
 python3 regression_test.py record
 ```
 
@@ -53,7 +53,7 @@ python3 regression_test.py record
 ### Step 2: アップグレード後に比較検証を実行する (`verify`)
 
 ```bash
-cd /home/ayosino/biancafiori_regression_test
+cd $HOME/biancafiori_regression_test
 python3 regression_test.py verify
 ```
 （コマンドライン引数 `--auth "ユーザー名:パスワード"` 等も同様に使えます）
