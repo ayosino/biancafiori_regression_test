@@ -14,7 +14,8 @@
    - `/32_program_additional/` （第32回定演 Webパンフレット）
    - `/33_program_additional/` （第33回定演 Webパンフレット）
 2. **団員専用サイト**
-   - `http://biancafiori.ciao.jp/members/` （**BASIC認証あり**）
+   - メンテ前: `http://biancafiori.ciao.jp/members/` （**BASIC認証あり**）
+   - メンテ・SSL化後: `https://members.biancafiori.com/` （**BASIC認証あり**）
 
 ### アップグレード前後で比較・検証される項目
 - **BASIC認証の保護＆ログイン疎通**
@@ -24,6 +25,9 @@
 - **各ページの `<title>`・見出し（`<h1>`/`<h2>`）・本文テキスト・ページ内リンクの一致**
 - **ページ内の全画像・CSS・JS・PDF・内部リンクのステータスコード一致**
 - **PHPエラー（Fatal/Warning/Deprecated等）・WordPress重大エラー・テスト用URL（`test.biancafiori.com`）の混入がないこと**
+- **SSL化・URL移転後（`--https` / `--members-url` 指定時）のURL読み替え比較＆Mixed Content 検出**
+  - `http://biancafiori.com` → `https://biancafiori.com`、および `http://biancafiori.ciao.jp/members/` → `https://members.biancafiori.com/` のURL変化を自動で読み替えて既存の `baseline.json` と比較可能
+  - `https://` ページ内の画像・CSS・JS・iframe・音声・動画等のサブリソースに `http://` が残っている場合（Mixed Content）をエラーとして検出
 
 ---
 
@@ -57,6 +61,17 @@ cd $HOME/biancafiori_regression_test
 python3 regression_test.py verify
 ```
 （コマンドライン引数 `--auth "ユーザー名:パスワード"` 等も同様に使えます）
+
+#### SSL導入・団員サイトURL移転後（`https://` への切り替え後）に比較検証する場合
+`--https` オプションを付与すると、`https://biancafiori.com` および `https://members.biancafiori.com/` に対して巡回・検証を行い、`http://` 時代に記録した `baseline.json`（`http://biancafiori.ciao.jp/members/` 含む）と自動読み替えの上で比較できます（ページ内アセットの `http://` 残存＝Mixed Content も自動検出します）。
+
+```bash
+# https://biancafiori.com と https://members.biancafiori.com/ を巡回して baseline.json と比較
+python3 regression_test.py verify --https
+
+# 団員専用サイトのURLを個別に明示指定する場合
+python3 regression_test.py verify --https --members-url https://members.biancafiori.com/
+```
 
 - アップグレード前後で変化がなければ **`判定結果: PASS (アップグレード前後の差分 0 件)`** となります。
 - 変化があった場合は具体的な差分内容（どのURLの何がどう変わったか）がターミナルと `reports/report_verify_YYYYMMDD_HHMMSS.md` に出力されます。

@@ -12,6 +12,9 @@ Biancafiori WordPress Upgrade Regression Test
 
   2. メンテ後 (ベースラインとの差分検証):
      python3 regression_test.py verify
+
+  3. SSL導入後 (https:// に切り替えてベースラインと比較検証):
+     python3 regression_test.py verify --https
 """
 
 import argparse
@@ -32,8 +35,13 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
-BASE_URL = "http://biancafiori.com"
-MEMBERS_URL = "http://biancafiori.ciao.jp/members/"
+BASE_HOST = "biancafiori.com"
+MEMBERS_HOST = "biancafiori.ciao.jp"
+HTTPS_MEMBERS_HOST = "members.biancafiori.com"
+BASE_URL = f"http://{BASE_HOST}"
+HTTPS_BASE_URL = f"https://{BASE_HOST}"
+MEMBERS_URL = f"http://{MEMBERS_HOST}/members/"
+HTTPS_MEMBERS_URL = f"https://{HTTPS_MEMBERS_HOST}/"
 DEFAULT_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.json")
 DEFAULT_REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
@@ -107,6 +115,97 @@ def normalize_url(url: str, base_url: str) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, query, ""))
 
 
+MEMBERS_PREFIX_RE = re.compile(
+    r"^https?://(?:biancafiori\.ciao(?:\.co)?\.jp/members|members\.biancafiori\.com)(?=/|\?|#|$)",
+    re.IGNORECASE,
+)
+BASE_PREFIX_RE = re.compile(
+    r"^https?://biancafiori\.com(?=/|\?|#|$)",
+    re.IGNORECASE,
+)
+
+
+def is_members_scope_url(url: str | None, target_members_url: str | None = None) -> bool:
+    """URLが団員専用サイト (biancafiori.ciao.jp/members または members.biancafiori.com 等) に属するか判定する"""
+    if not url:
+        return False
+    if MEMBERS_PREFIX_RE.match(url):
+        return True
+    if target_members_url:
+        tm_root = target_members_url.rstrip("/")
+        if url.lower().startswith(tm_root.lower()):
+            rest = url[len(tm_root):]
+            if not rest or rest.startswith(("/", "?", "#")):
+                return True
+    return False
+
+
+def rewrite_in_scope_url(
+    url: str | None,
+    target_base_url: str = BASE_URL,
+    target_members_url: str = MEMBERS_URL,
+) -> str | None:
+    """
+    テスト対象サイトのURLを指定されたターゲットURL体系に変換する。
+    - http://biancafiori.com/... <-> https://biancafiori.com/...
+    - http://biancafiori.ciao.jp/members/... <-> https://members.biancafiori.com/... (等)
+    """
+    if not url:
+        return url
+
+    tm_root = target_members_url.rstrip("/")
+    tm_has_path = bool(urllib.parse.urlsplit(tm_root).path)
+
+    m_mem = MEMBERS_PREFIX_RE.match(url)
+    if not m_mem and tm_root:
+        custom_mem_re = re.compile(rf"^https?://{re.escape(urllib.parse.urlsplit(tm_root).netloc)}{re.escape(urllib.parse.urlsplit(tm_root).path)}(?=/|\?|#|$)", re.IGNORECASE)
+        m_mem = custom_mem_re.match(url)
+
+    if m_mem:
+        rest = url[m_mem.end():]
+        if not rest:
+            if not tm_has_path:
+                rest = "/"
+        elif rest.startswith(("?", "#")):
+            rest = "/" + rest
+        return tm_root + rest
+
+    tb_root = target_base_url.rstrip("/")
+    m_base = BASE_PREFIX_RE.match(url)
+    if m_base:
+        rest = url[m_base.end():]
+        if rest.startswith(("?", "#")):
+            rest = "/" + rest
+        return tb_root + rest
+
+    return url
+
+
+def normalize_in_scope_text_scheme(
+    text: str,
+    target_base_url: str = BASE_URL,
+    target_members_url: str = MEMBERS_URL,
+) -> str:
+    """本文テキスト中に記載された対象サイトURL (旧members URLやhttp/httpsの違い) を正規化する"""
+    if not text:
+        return text
+    tm_root = target_members_url.rstrip("/")
+    tb_root = target_base_url.rstrip("/")
+    text = re.sub(
+        r"https?://(?:biancafiori\.ciao(?:\.co)?\.jp/members|members\.biancafiori\.com)/?",
+        tm_root + "/",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"https?://biancafiori\.com",
+        tb_root,
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
 def extract_main_text(soup: BeautifulSoup) -> str:
     """ページのメインコンテンツ領域のテキストを抽出・正規化する（動的ウィジェット等のノイズを除外）"""
     clone = BeautifulSoup(str(soup), "html.parser")
@@ -140,13 +239,25 @@ class SiteCrawler:
         auth_30: str | None = None,
         auth_members: str | None = None,
         skip_members: bool = False,
+        use_https: bool = False,
+        base_url: str | None = None,
+        members_url: str | None = None,
         workers: int = 8,
         timeout: int = 20,
     ):
-        self.base_url = BASE_URL
-        self.base_host = "biancafiori.com"
-        self.members_url = MEMBERS_URL
-        self.members_host = "biancafiori.ciao.jp"
+        default_base = HTTPS_BASE_URL if use_https else BASE_URL
+        default_members = HTTPS_MEMBERS_URL if use_https else MEMBERS_URL
+        self.base_url = (base_url or default_base).rstrip("/")
+        raw_members = members_url or default_members
+        self.members_url = raw_members if raw_members.endswith("/") else raw_members + "/"
+        self.use_https = (
+            use_https
+            or self.base_url.lower().startswith("https://")
+            or self.members_url.lower().startswith("https://")
+        )
+        self.scheme = "https" if self.use_https else "http"
+        self.base_host = urllib.parse.urlsplit(self.base_url).netloc.lower()
+        self.members_host = urllib.parse.urlsplit(self.members_url).netloc.lower()
         self.auth_30 = auth_30
         self.auth_members = auth_members
         self.skip_members = skip_members
@@ -160,7 +271,7 @@ class SiteCrawler:
         if host == self.base_host and path.startswith("/30_years_anniversary"):
             if self.auth_30:
                 return make_basic_auth_header(self.auth_30)
-        if host == self.members_host and path.startswith("/members"):
+        if is_members_scope_url(url, self.members_url):
             if self.auth_members:
                 return make_basic_auth_header(self.auth_members)
         return None
@@ -168,10 +279,9 @@ class SiteCrawler:
     def is_in_scope(self, url: str) -> bool:
         parsed = urllib.parse.urlsplit(url)
         host = parsed.netloc.lower()
-        path = urllib.parse.unquote(parsed.path)
         if host == self.base_host:
             return True
-        if not self.skip_members and host == self.members_host and path.startswith("/members"):
+        if not self.skip_members and is_members_scope_url(url, self.members_url):
             return True
         return False
 
@@ -234,10 +344,12 @@ class SiteCrawler:
             }
         ]
         if not self.skip_members:
+            parsed_m = urllib.parse.urlsplit(self.members_url)
+            m_label = f"{parsed_m.netloc}{parsed_m.path}"
             targets.append(
                 {
                     "id": "members",
-                    "name": "団員専用サイト (biancafiori.ciao.jp/members/)",
+                    "name": f"団員専用サイト ({m_label})",
                     "url": self.members_url,
                     "creds": self.auth_members,
                 }
@@ -300,9 +412,11 @@ class SiteCrawler:
                 path = urllib.parse.unquote(parsed.path)
                 if path.startswith("/30_years_anniversary") and not self.auth_30:
                     continue
-                if parsed.netloc.lower() == self.members_host and (self.skip_members or not self.auth_members):
+                if is_members_scope_url(bu, self.members_url) and (self.skip_members or not self.auth_members):
                     continue
-                seeds.add(bu)
+                rewritten_bu = rewrite_in_scope_url(bu, self.base_url, self.members_url)
+                if rewritten_bu:
+                    seeds.add(rewritten_bu)
 
         wp_roots = []
         for sub in SUB_WP_PATHS:
@@ -324,7 +438,7 @@ class SiteCrawler:
                                 link = item.get("link") if isinstance(item, dict) else None
                                 nu = normalize_url(link, wpr + "/")
                                 if nu and self.is_in_scope(nu):
-                                    seeds.add(nu)
+                                    seeds.add(rewrite_in_scope_url(nu, self.base_url, self.members_url))
                     except Exception:
                         pass
 
@@ -343,7 +457,7 @@ class SiteCrawler:
                                 if elem.tag.endswith("loc") and elem.text:
                                     nu = normalize_url(elem.text, sm_url)
                                     if nu and self.is_in_scope(nu):
-                                        seeds.add(nu)
+                                        seeds.add(rewrite_in_scope_url(nu, self.base_url, self.members_url))
                         except Exception:
                             pass
 
@@ -391,6 +505,7 @@ class SiteCrawler:
                 "content_text": "",
                 "php_errors": [],
                 "test_domain_refs": [],
+                "mixed_content_refs": [],
                 "links": [],
             }
 
@@ -446,6 +561,7 @@ class SiteCrawler:
             ]
 
             links_set = set()
+            mixed_content_set = set()
             for tag_name, attr_name, kind in tag_attrs:
                 for tag in soup.find_all(tag_name):
                     val = tag.get(attr_name)
@@ -462,6 +578,10 @@ class SiteCrawler:
 
                     rel = tag.get("rel", [])
                     rel_str = " ".join(rel).lower() if isinstance(rel, list) else str(rel).lower()
+                    is_subresource = (
+                        kind in ("asset", "srcset", "embed")
+                        or (kind == "link_tag" and ("stylesheet" in rel_str or "icon" in rel_str or "preload" in rel_str))
+                    )
 
                     for raw_u in raw_urls:
                         norm_u = normalize_url(raw_u, url)
@@ -474,10 +594,13 @@ class SiteCrawler:
                         if host == "test.biancafiori.com":
                             page_info["test_domain_refs"].append(urllib.parse.unquote(norm_u))
 
+                        if self.use_https and is_subresource and parsed_u.scheme.lower() == "http":
+                            mixed_content_set.add(urllib.parse.unquote(norm_u))
+
                         if self.is_in_scope(norm_u):
                             if path_lower.startswith("/30_years_anniversary") and not self.auth_30:
                                 continue
-                            if host == self.members_host and not self.auth_members:
+                            if is_members_scope_url(norm_u, self.members_url) and not self.auth_members:
                                 continue
 
                             is_asset_ext = path_lower.endswith(ASSET_EXTENSIONS)
@@ -490,15 +613,17 @@ class SiteCrawler:
                                 or path_lower.endswith("/feed")
                             )
 
+                            target_u = rewrite_in_scope_url(norm_u, self.base_url, self.members_url)
                             if kind == "link" and not is_asset_ext and not is_wp_system:
-                                links_set.add(urllib.parse.unquote(norm_u))
-                                discovered_pages.append(norm_u)
-                                discovered_assets.append((norm_u, decoded_url))
+                                links_set.add(urllib.parse.unquote(target_u))
+                                discovered_pages.append(target_u)
+                                discovered_assets.append((target_u, decoded_url))
                             else:
                                 if kind in ("asset", "srcset", "embed") or "stylesheet" in rel_str or "icon" in rel_str or is_asset_ext:
                                     if not is_wp_system:
-                                        discovered_assets.append((norm_u, decoded_url))
+                                        discovered_assets.append((target_u, decoded_url))
 
+            page_info["mixed_content_refs"] = sorted(mixed_content_set)
             page_info["links"] = sorted(links_set)
             return url, page_info, discovered_pages, discovered_assets
 
@@ -524,7 +649,11 @@ class SiteCrawler:
                             queued_set.add(pu)
                             queue.append(pu)
                     st_str = str(p_info["status"])
-                    color = Colors.GREEN if p_info["status"] == 200 and not p_info["php_errors"] else Colors.YELLOW
+                    color = (
+                        Colors.GREEN
+                        if p_info["status"] == 200 and not p_info["php_errors"] and not p_info.get("mixed_content_refs")
+                        else Colors.YELLOW
+                    )
                     print(f"  [{len(pages_data):3d}] {color}{st_str}{Colors.RESET} {p_info['decoded_url']}", flush=True)
 
         visited_url_status = {u: info["status"] for u, info in pages_data.items()}
@@ -572,10 +701,40 @@ class SiteCrawler:
 
 def compare_before_after(baseline: dict, current: dict) -> dict:
     """ベースライン (record) とアップグレード後 (verify) を比較し、変化があった箇所をすべて抽出する"""
-    base_pages = baseline.get("pages", {})
-    curr_pages = current.get("pages", {})
-    base_assets = baseline.get("assets", {})
-    curr_assets = current.get("assets", {})
+    curr_base_url = current.get("base_url") or BASE_URL
+    curr_members_url = current.get("members_url") or (
+        HTTPS_MEMBERS_URL if curr_base_url.lower().startswith("https://") else MEMBERS_URL
+    )
+
+    raw_base_pages = baseline.get("pages", {})
+    raw_curr_pages = current.get("pages", {})
+    raw_base_assets = baseline.get("assets", {})
+    raw_curr_assets = current.get("assets", {})
+
+    base_pages = {}
+    for u, p in raw_base_pages.items():
+        ru = rewrite_in_scope_url(u, curr_base_url, curr_members_url)
+        if ru not in base_pages or u.endswith("/"):
+            base_pages[ru] = p
+
+    curr_pages = {}
+    for u, p in raw_curr_pages.items():
+        ru = rewrite_in_scope_url(u, curr_base_url, curr_members_url)
+        if ru not in curr_pages or u.endswith("/"):
+            curr_pages[ru] = p
+
+    base_assets = {}
+    for u, a in raw_base_assets.items():
+        ru = rewrite_in_scope_url(u, curr_base_url, curr_members_url)
+        if ru not in base_assets or u.endswith("/"):
+            base_assets[ru] = a
+
+    curr_assets = {}
+    for u, a in raw_curr_assets.items():
+        ru = rewrite_in_scope_url(u, curr_base_url, curr_members_url)
+        if ru not in curr_assets or u.endswith("/"):
+            curr_assets[ru] = a
+
     base_auth = {b["id"]: b for b in baseline.get("basic_auth_checks", []) if "id" in b}
 
     diffs = []
@@ -615,7 +774,7 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
             b["credentials_provided"] for b in current.get("basic_auth_checks", []) if b.get("id") == "30_years_anniversary"
         ):
             continue
-        if parsed.netloc.lower() == "biancafiori.ciao.jp" and not any(
+        if is_members_scope_url(u, curr_members_url) and not any(
             b["credentials_provided"] for b in current.get("basic_auth_checks", []) if b.get("id") == "members"
         ):
             continue
@@ -623,7 +782,7 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
         if bp and not cp:
             diffs.append({
                 "category": "ページ欠落",
-                "target": bp["decoded_url"],
+                "target": rewrite_in_scope_url(bp["decoded_url"], curr_base_url, curr_members_url),
                 "detail": f"ベースライン時に存在したページ (HTTP {bp['status']}) が巡回されませんでした",
             })
             continue
@@ -635,6 +794,12 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
                     "category": "新規リンク先のHTTPエラー",
                     "target": cp["decoded_url"],
                     "detail": f"Status: {cp['status']}",
+                })
+            if cp.get("mixed_content_refs"):
+                diffs.append({
+                    "category": "Mixed Content (httpアセット残存)",
+                    "target": cp["decoded_url"],
+                    "detail": f"ページ内のアセットに http:// が残っています ({len(cp['mixed_content_refs'])}件): {cp['mixed_content_refs'][:3]}",
                 })
             continue
 
@@ -649,12 +814,14 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
                 "detail": f"Before: {bp['status']} -> After: {cp['status']}",
             })
 
-        # (b) リダイレクト先URLの変化
-        if bp.get("final_decoded_url") != cp.get("final_decoded_url"):
+        # (b) リダイレクト先URLの変化 (SSL化やmembersドメイン変更に伴う正規URL変化は許容)
+        bp_final = rewrite_in_scope_url(bp.get("final_decoded_url"), curr_base_url, curr_members_url)
+        cp_final = cp.get("final_decoded_url")
+        if bp_final != cp_final:
             diffs.append({
                 "category": "リダイレクト先変化",
                 "target": decoded,
-                "detail": f"Before: {bp.get('final_decoded_url')} -> After: {cp.get('final_decoded_url')}",
+                "detail": f"Before: {bp.get('final_decoded_url')} -> After: {cp_final}",
             })
 
         # (c) PHPエラー・WordPress重大エラーの混入
@@ -671,6 +838,14 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
                 "category": "テストURL混入",
                 "target": decoded,
                 "detail": f"test.biancafiori.com への参照: {cp['test_domain_refs'][:3]}",
+            })
+
+        # (d2) Mixed Content (HTTPSページ内の http:// アセット残存) の検出
+        if cp.get("mixed_content_refs"):
+            diffs.append({
+                "category": "Mixed Content (httpアセット残存)",
+                "target": decoded,
+                "detail": f"ページ内のアセットに http:// が残っています ({len(cp['mixed_content_refs'])}件): {cp['mixed_content_refs'][:3]}",
             })
 
         if bp["status"] == 200 and cp["status"] == 200:
@@ -690,31 +865,34 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
                     "detail": f"Before: {bp.get('headings')} -> After: {cp.get('headings')}",
                 })
 
-            # (g) 本文テキストの変化
+            # (g) 本文テキストの変化 (本文中の対象サイトURLの http/https や members URL変化は許容)
             if bp.get("content_hash") != cp.get("content_hash"):
-                b_text = bp.get("content_text", "")
-                c_text = cp.get("content_text", "")
-                b_len = bp.get("content_length", 0)
-                c_len = cp.get("content_length", 0)
-                # 差分箇所の抜粋を作成
-                matcher = difflib.SequenceMatcher(None, b_text, c_text)
-                diff_snippets = []
-                for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                    if tag != "equal":
-                        diff_snippets.append(f"[{tag}] '{b_text[i1:i2][:40]}' -> '{c_text[j1:j2][:40]}'")
-                        if len(diff_snippets) >= 3:
-                            break
-                snippet_str = " / ".join(diff_snippets)
-                diffs.append({
-                    "category": "本文テキスト変化",
-                    "target": decoded,
-                    "detail": f"文字数: {b_len} -> {c_len} ({snippet_str})",
-                })
+                b_text = normalize_in_scope_text_scheme(bp.get("content_text", ""), curr_base_url, curr_members_url)
+                c_text = normalize_in_scope_text_scheme(cp.get("content_text", ""), curr_base_url, curr_members_url)
+                if b_text != c_text:
+                    b_len = bp.get("content_length", 0)
+                    c_len = cp.get("content_length", 0)
+                    # 差分箇所の抜粋を作成
+                    matcher = difflib.SequenceMatcher(None, b_text, c_text)
+                    diff_snippets = []
+                    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                        if tag != "equal":
+                            diff_snippets.append(f"[{tag}] '{b_text[i1:i2][:40]}' -> '{c_text[j1:j2][:40]}'")
+                            if len(diff_snippets) >= 3:
+                                break
+                    snippet_str = " / ".join(diff_snippets)
+                    diffs.append({
+                        "category": "本文テキスト変化",
+                        "target": decoded,
+                        "detail": f"文字数: {b_len} -> {c_len} ({snippet_str})",
+                    })
 
-            # (h) ページ内リンク一覧の変化
-            if bp.get("links") != cp.get("links"):
-                removed = sorted(set(bp.get("links", [])) - set(cp.get("links", [])))
-                added = sorted(set(cp.get("links", [])) - set(bp.get("links", [])))
+            # (h) ページ内リンク一覧の変化 (対象サイトURLの http/https や members URL変化は許容)
+            b_links = {rewrite_in_scope_url(l, curr_base_url, curr_members_url) for l in bp.get("links", [])}
+            c_links = {rewrite_in_scope_url(l, curr_base_url, curr_members_url) for l in cp.get("links", [])}
+            if b_links != c_links:
+                removed = sorted(b_links - c_links)
+                added = sorted(c_links - b_links)
                 diffs.append({
                     "category": "ページ内リンク変化",
                     "target": decoded,
@@ -729,7 +907,7 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
             b["credentials_provided"] for b in current.get("basic_auth_checks", []) if b.get("id") == "30_years_anniversary"
         ):
             continue
-        if parsed.netloc.lower() == "biancafiori.ciao.jp" and not any(
+        if is_members_scope_url(u, curr_members_url) and not any(
             b["credentials_provided"] for b in current.get("basic_auth_checks", []) if b.get("id") == "members"
         ):
             continue
@@ -739,7 +917,7 @@ def compare_before_after(baseline: dict, current: dict) -> dict:
             if ba["status"] == 200:
                 diffs.append({
                     "category": "アセット・リンク参照消失",
-                    "target": ba["decoded_url"],
+                    "target": rewrite_in_scope_url(ba["decoded_url"], curr_base_url, curr_members_url),
                     "detail": f"ベースライン時に存在したアセット (参照元: {ba.get('sources', [])[:2]}) が見つかりません",
                 })
             continue
@@ -772,7 +950,7 @@ def generate_markdown_report(baseline: dict, current: dict, comparison: dict) ->
         "# Biancafiori WordPress Upgrade Regression Report",
         "",
         f"- **判定結果**: **{status_badge}**",
-        f"- **ベースライン記録日時**: `{baseline.get('timestamp')}`",
+        f"- **ベースライン記録日時**: `{baseline.get('timestamp')}` (`{baseline.get('base_url', BASE_URL)}` / `{baseline.get('members_url') or 'スキップ'}`)",
         f"- **検証実行日時**: `{current.get('timestamp')}`",
         f"- **対象URL**: `{current.get('base_url')}` / `{current.get('members_url') or 'スキップ'}`",
         "",
@@ -820,6 +998,9 @@ def prompt_credentials_if_needed(args) -> tuple[str | None, str | None]:
     if args.no_prompt or not sys.stdin.isatty():
         return auth_30, auth_members
 
+    default_members = HTTPS_MEMBERS_URL if getattr(args, "https", False) else MEMBERS_URL
+    members_url_disp = getattr(args, "members_url", None) or default_members
+
     if not auth_30:
         print(f"\n{Colors.BOLD}[BASIC認証入力] 30周年記念サイト (/30_years_anniversary/){Colors.RESET}")
         user_30 = input("  ユーザー名 (空Enterで認証後クロールをスキップ): ").strip()
@@ -828,7 +1009,7 @@ def prompt_credentials_if_needed(args) -> tuple[str | None, str | None]:
             auth_30 = f"{user_30}:{pass_30}"
 
     if not args.skip_members and not auth_members:
-        print(f"\n{Colors.BOLD}[BASIC認証入力] 団員専用サイト ({MEMBERS_URL}){Colors.RESET}")
+        print(f"\n{Colors.BOLD}[BASIC認証入力] 団員専用サイト ({members_url_disp}){Colors.RESET}")
         if auth_30:
             same = input("  30周年記念サイトと同じ認証情報を使いますか？ [Y/n]: ").strip().lower()
             if same in ("", "y", "yes"):
@@ -851,8 +1032,27 @@ def main():
         "mode",
         choices=["record", "verify"],
         help=(
-            "record : アップグレード前の http://biancafiori.com の状態を baseline.json に保存します\n"
-            "verify : アップグレード後の http://biancafiori.com を巡回し、baseline.json から変化がないか検証します"
+            "record : アップグレード前の対象サイトの状態を baseline.json に保存します\n"
+            "verify : アップグレード後の対象サイトを巡回し、baseline.json から変化がないか検証します"
+        ),
+    )
+    parser.add_argument(
+        "--https",
+        action="store_true",
+        help=(
+            "SSL化・移転後のURL体系 (https://biancafiori.com および https://members.biancafiori.com/) で巡回・検証し、\n"
+            "旧URLベースラインとの自動読み替え比較および Mixed Content チェックを行う"
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        help="メインサイトのベースURLを個別に指定する場合に使用 (例: https://biancafiori.com)",
+    )
+    parser.add_argument(
+        "--members-url",
+        help=(
+            "団員専用サイトのURLを個別に指定する場合に使用 (例: https://members.biancafiori.com/)\n"
+            "※ ベースラインの http://biancafiori.ciao.jp/members/ から自動で読み替えて比較します"
         ),
     )
     parser.add_argument(
@@ -870,7 +1070,7 @@ def main():
     parser.add_argument(
         "--skip-members",
         action="store_true",
-        help="団員専用サイト (biancafiori.ciao.jp/members/) を対象外にする",
+        help="団員専用サイトを対象外にする",
     )
     parser.add_argument(
         "--no-prompt",
@@ -907,6 +1107,9 @@ def main():
         auth_30=auth_30,
         auth_members=auth_members,
         skip_members=args.skip_members,
+        use_https=args.https,
+        base_url=args.base_url,
+        members_url=args.members_url,
         workers=args.workers,
     )
 
